@@ -31,6 +31,7 @@ import (
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
 	larkapplication "github.com/larksuite/oapi-sdk-go/v3/service/application/v6"
 	larkcontact "github.com/larksuite/oapi-sdk-go/v3/service/contact/v3"
+	larkdrive "github.com/larksuite/oapi-sdk-go/v3/service/drive/v1"
 	larkim "github.com/larksuite/oapi-sdk-go/v3/service/im/v1"
 	larkws "github.com/larksuite/oapi-sdk-go/v3/ws"
 )
@@ -109,6 +110,13 @@ func init() {
 type replyContext struct {
 	messageID  string
 	chatID     string
+	sessionKey string
+}
+
+type docCommentReplyContext struct {
+	fileToken  string
+	fileType   string
+	commentID  string
 	sessionKey string
 }
 
@@ -533,6 +541,14 @@ func (p *Platform) Start(handler core.MessageHandler) error {
 			for _, sibling := range p.sharedGroup.allPlatforms() {
 				if err := sibling.onBotMenu(event); err != nil {
 					slog.Error("shared ws: onBotMenu error", "err", err)
+				}
+			}
+			return nil
+		}).
+		OnP2NoticeCommentAddV1(func(ctx context.Context, event *larkdrive.P2NoticeCommentAddV1) error {
+			for _, sibling := range p.sharedGroup.allPlatforms() {
+				if err := sibling.onDocComment(ctx, event); err != nil {
+					slog.Error("shared ws: onDocComment error", "err", err)
 				}
 			}
 			return nil
@@ -1018,7 +1034,7 @@ func (p *Platform) IsMessageRecalled(ctx context.Context, rctx any) (bool, error
 
 	req := larkim.NewGetMessageReqBuilder().
 		MessageId(messageID).
-		UserIdType(larkim.UserIdTypeGetMessageOpenId).
+		UserIdType(larkim.UserIdTypeOpenId).
 		Build()
 
 	var resp *larkim.GetMessageResp
@@ -1377,12 +1393,107 @@ func (p *Platform) onMessage(ctx context.Context, event *larkim.P2MessageReceive
 	return nil
 }
 
+func (p *Platform) onDocComment(ctx context.Context, event *larkdrive.P2NoticeCommentAddV1) error {
+	if event == nil || event.Event == nil || event.Event.NoticeMeta == nil {
+		return nil
+	}
+	meta := event.Event.NoticeMeta
+	fileToken := stringValue(meta.FileToken)
+	fileType := stringValue(meta.FileType)
+	commentID := stringValue(event.Event.CommentId)
+	replyID := stringValue(event.Event.ReplyId)
+	noticeType := stringValue(meta.NoticeType)
+	userID := userIDFromDriveUser(meta.FromUserId)
+	if fileToken == "" || fileType == "" || commentID == "" || userID == "" {
+		slog.Debug(p.tag()+": doc comment missing required fields",
+			"file_type", fileType,
+			"has_file_token", fileToken != "",
+			"has_comment_id", commentID != "",
+			"has_user_id", userID != "",
+		)
+		return nil
+	}
+	if event.Event.IsMentioned != nil && !*event.Event.IsMentioned {
+		slog.Debug(p.tag()+": doc comment ignored because bot was not mentioned", "comment_id", commentID)
+		return nil
+	}
+	if noticeType != "" && noticeType != "add_comment" && noticeType != "add_reply" {
+		slog.Debug(p.tag()+": doc comment ignored because notice type is unsupported", "notice_type", noticeType)
+		return nil
+	}
+	if p.getBotOpenID() != "" && meta.FromUserId != nil && stringValue(meta.FromUserId.OpenId) == p.getBotOpenID() {
+		slog.Debug(p.tag()+": doc comment ignored from self", "comment_id", commentID)
+		return nil
+	}
+
+	eventID := ""
+	var createTimeMs int64
+	if event.EventV2Base != nil && event.EventV2Base.Header != nil {
+		eventID = event.EventV2Base.Header.EventID
+		if ms, err := strconv.ParseInt(event.EventV2Base.Header.CreateTime, 10, 64); err == nil {
+			createTimeMs = ms
+			if core.IsOldMessage(time.Unix(ms/1000, (ms%1000)*int64(time.Millisecond))) {
+				slog.Debug(p.tag()+": ignoring old doc comment after restart", "create_time", event.EventV2Base.Header.CreateTime)
+				return nil
+			}
+		}
+	}
+	if eventID == "" {
+		eventID = "doc-comment:" + fileToken + ":" + commentID + ":" + replyID
+	}
+	if p.dedup.IsDuplicate(eventID) {
+		slog.Debug(p.tag()+": duplicate doc comment ignored", "event_id", eventID)
+		return nil
+	}
+	if !core.AllowList(p.allowFrom, userID) {
+		slog.Debug(p.tag()+": doc comment from unauthorized user", "user", userID)
+		p.replyUnauthorizedDocComment(ctx, docCommentReplyContext{fileToken: fileToken, fileType: fileType, commentID: commentID})
+		return nil
+	}
+
+	sessionKey := fmt.Sprintf("%s:doc:%s:%s:%s", p.tag(), fileToken, commentID, userID)
+	rctx := docCommentReplyContext{
+		fileToken:  fileToken,
+		fileType:   fileType,
+		commentID:  commentID,
+		sessionKey: sessionKey,
+	}
+	content := buildDocCommentPrompt(fileType, fileToken, commentID, replyID, noticeType)
+	slog.Info(p.tag()+": doc comment received",
+		"event_id", eventID,
+		"user_id", userID,
+		"file_type", fileType,
+		"comment_id", commentID,
+		"reply_id", replyID,
+	)
+	go p.dispatchCoreMessage(&core.Message{
+		SessionKey:        sessionKey,
+		Platform:          p.platformName,
+		MessageID:         eventID,
+		UserID:            userID,
+		UserName:          p.resolveUserName(userID),
+		Content:           content,
+		ReplyCtx:          rctx,
+		UserMessageTimeMs: createTimeMs,
+	})
+	return nil
+}
+
 func (p *Platform) replyUnauthorizedAccess(ctx context.Context, rctx replyContext) {
 	if rctx.messageID == "" && rctx.chatID == "" {
 		return
 	}
 	if err := p.Reply(ctx, rctx, core.UnauthorizedAccessMessage); err != nil {
 		slog.Warn(p.tag()+": unauthorized reply failed", "error", err)
+	}
+}
+
+func (p *Platform) replyUnauthorizedDocComment(ctx context.Context, rctx docCommentReplyContext) {
+	if rctx.fileToken == "" || rctx.fileType == "" || rctx.commentID == "" {
+		return
+	}
+	if err := p.Send(ctx, rctx, core.UnauthorizedAccessMessage); err != nil {
+		slog.Warn(p.tag()+": unauthorized doc comment reply failed", "error", err)
 	}
 }
 
@@ -1682,6 +1793,22 @@ func (p *Platform) resolveUserName(openID string) string {
 }
 
 func userIDFromEvent(id *larkim.UserId) string {
+	if id == nil {
+		return ""
+	}
+	if id.OpenId != nil && *id.OpenId != "" {
+		return *id.OpenId
+	}
+	if id.UserId != nil && *id.UserId != "" {
+		return *id.UserId
+	}
+	if id.UnionId != nil && *id.UnionId != "" {
+		return *id.UnionId
+	}
+	return ""
+}
+
+func userIDFromDriveUser(id *larkdrive.UserId) string {
 	if id == nil {
 		return ""
 	}
@@ -2595,6 +2722,9 @@ func (p *Platform) formatMergeForwardTree(parentID string, childrenMap map[strin
 }
 
 func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
+	if rc, ok := rctx.(docCommentReplyContext); ok {
+		return p.replyDocComment(ctx, rc, content)
+	}
 	rc, ok := rctx.(replyContext)
 	if !ok {
 		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
@@ -2613,6 +2743,9 @@ func (p *Platform) Reply(ctx context.Context, rctx any, content string) error {
 // is sent as a reply (quoting the original) so the conversation stays threaded.
 // Falls back to creating a standalone message when no message ID exists.
 func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
+	if rc, ok := rctx.(docCommentReplyContext); ok {
+		return p.replyDocComment(ctx, rc, content)
+	}
 	rc, ok := rctx.(replyContext)
 	if !ok {
 		return fmt.Errorf("%s: invalid reply context type %T", p.tag(), rctx)
@@ -2627,11 +2760,123 @@ func (p *Platform) Send(ctx context.Context, rctx any, content string) error {
 	return p.sendNewMessageToChat(ctx, rc, msgType, msgBody)
 }
 
+func (p *Platform) replyDocComment(ctx context.Context, rc docCommentReplyContext, content string) error {
+	_, _, err := p.replyDocCommentThread(ctx, rc, content)
+	return err
+}
+
+func (p *Platform) replyDocCommentWithFallback(ctx context.Context, rc docCommentReplyContext, content string) error {
+	code, msg, err := p.replyDocCommentThread(ctx, rc, content)
+	if err == nil {
+		return nil
+	}
+	if code == 1069302 {
+		slog.Info(p.tag()+": doc comment thread does not allow replies; creating fallback comment",
+			"file_type", rc.fileType,
+			"comment_id", rc.commentID,
+			"code", code,
+			"msg", msg,
+		)
+		return p.createDocCommentFallback(ctx, rc, content)
+	}
+	return err
+}
+
+func (p *Platform) replyDocCommentThread(ctx context.Context, rc docCommentReplyContext, content string) (int, string, error) {
+	if rc.fileToken == "" || rc.fileType == "" || rc.commentID == "" {
+		return 0, "", fmt.Errorf("%s: invalid doc comment reply context", p.tag())
+	}
+	content = strings.TrimSpace(content)
+	if content == "" {
+		return 0, "", nil
+	}
+
+	elements := buildDocCommentTextElements(content)
+	if len(elements) == 0 {
+		return 0, "", nil
+	}
+	req := larkdrive.NewCreateFileCommentReplyReqBuilder().
+		FileToken(rc.fileToken).
+		CommentId(rc.commentID).
+		FileType(rc.fileType).
+		UserIdType(larkdrive.UserIdTypeCreateFileCommentReplyOpenId).
+		Body(larkdrive.NewCreateFileCommentReplyReqBodyBuilder().
+			Content(larkdrive.NewReplyContentBuilder().
+				Elements(elements).
+				Build()).
+			Build()).
+		Build()
+
+	var replyRespCode int
+	var replyRespMsg string
+	err := p.withTransientRetry(ctx, "doc comment reply", func() error {
+		return p.withFreshTenantAccessTokenRetry(ctx, "doc comment reply", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
+			resp, err := client.Drive.FileCommentReply.Create(ctx, req, options...)
+			if err != nil {
+				return fmt.Errorf("%s: doc comment reply api call: %w", p.tag(), err)
+			}
+			if !resp.Success() {
+				replyRespCode = resp.Code
+				replyRespMsg = resp.Msg
+				return fmt.Errorf("%s: doc comment reply failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+			}
+			return nil
+		})
+	})
+	if err == nil {
+		return 0, "", nil
+	}
+	return replyRespCode, replyRespMsg, err
+}
+
+func (p *Platform) createDocCommentFallback(ctx context.Context, rc docCommentReplyContext, content string) error {
+	fallbackContent := "机器人回复（原评论不支持线程回复，comment_id: " + rc.commentID + "）:\n\n" + strings.TrimSpace(content)
+	elements := buildDocCommentTextElements(fallbackContent)
+	if len(elements) == 0 {
+		return nil
+	}
+	req := larkdrive.NewCreateFileCommentReqBuilder().
+		FileToken(rc.fileToken).
+		FileType(rc.fileType).
+		UserIdType(larkdrive.UserIdTypeCreateFileCommentOpenId).
+		FileComment(larkdrive.NewFileCommentBuilder().
+			ReplyList(larkdrive.NewReplyListBuilder().
+				Replies([]*larkdrive.FileCommentReply{
+					larkdrive.NewFileCommentReplyBuilder().
+						Content(larkdrive.NewReplyContentBuilder().
+							Elements(elements).
+							Build()).
+						Build(),
+				}).
+				Build()).
+			Build()).
+		Build()
+
+	return p.withTransientRetry(ctx, "doc comment fallback", func() error {
+		return p.withFreshTenantAccessTokenRetry(ctx, "doc comment fallback", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
+			resp, err := client.Drive.FileComment.Create(ctx, req, options...)
+			if err != nil {
+				return fmt.Errorf("%s: doc comment fallback api call: %w", p.tag(), err)
+			}
+			if !resp.Success() {
+				return fmt.Errorf("%s: doc comment fallback failed code=%d msg=%s", p.tag(), resp.Code, resp.Msg)
+			}
+			return nil
+		})
+	})
+}
+
 // SendWithStatusFooter implements core.StatusFooterSender: send a reply with
 // the body content followed by a small/dim status-footer block. Always uses
 // the interactive card path so the footer can render with text_size:
 // "notation". Falls back to plain Send when the footer is empty.
 func (p *Platform) SendWithStatusFooter(ctx context.Context, rctx any, content, footer string) error {
+	if rc, ok := rctx.(docCommentReplyContext); ok {
+		if strings.TrimSpace(footer) != "" {
+			content = strings.TrimSpace(content + "\n\n" + footer)
+		}
+		return p.replyDocCommentWithFallback(ctx, rc, content)
+	}
 	if strings.TrimSpace(footer) == "" {
 		return p.Send(ctx, rctx, content)
 	}
@@ -2755,13 +3000,13 @@ func detectFeishuFileType(mimeType, fileName string) string {
 	name := strings.ToLower(fileName)
 	switch {
 	case mimeType == "application/pdf" || strings.HasSuffix(name, ".pdf"):
-		return larkim.FileTypePdf
+		return larkim.CreateFileFileTypePdf
 	case strings.HasSuffix(name, ".doc") || strings.HasSuffix(name, ".docx"):
-		return larkim.FileTypeDoc
+		return larkim.CreateFileFileTypeDoc
 	case strings.HasSuffix(name, ".xls") || strings.HasSuffix(name, ".xlsx") || strings.HasSuffix(name, ".csv"):
-		return larkim.FileTypeXls
+		return larkim.CreateFileFileTypeXls
 	case strings.HasSuffix(name, ".ppt") || strings.HasSuffix(name, ".pptx"):
-		return larkim.FileTypePpt
+		return larkim.CreateFileFileTypePpt
 	// Feishu's file API only has "mp4" as the video type. We map all common
 	// video MIME types and extensions to FileTypeMp4 so the message renders
 	// as a native video player bubble rather than a generic file download.
@@ -2771,19 +3016,19 @@ func detectFeishuFileType(mimeType, fileName string) string {
 		strings.HasSuffix(name, ".mp4") || strings.HasSuffix(name, ".mov") ||
 		strings.HasSuffix(name, ".avi") || strings.HasSuffix(name, ".m4v") ||
 		strings.HasSuffix(name, ".mkv") || strings.HasSuffix(name, ".webm"):
-		return larkim.FileTypeMp4
+		return larkim.CreateFileFileTypeMp4
 	case mimeType == "audio/ogg" || mimeType == "audio/opus" || mimeType == "application/ogg" || strings.HasSuffix(name, ".ogg") || strings.HasSuffix(name, ".opus"):
-		return larkim.FileTypeOpus
+		return larkim.CreateFileFileTypeOpus
 	default:
-		return larkim.FileTypeStream
+		return larkim.CreateFileFileTypeStream
 	}
 }
 
 func detectFeishuFileMessageType(fileType string) string {
 	switch fileType {
-	case larkim.FileTypeOpus:
+	case larkim.CreateFileFileTypeOpus:
 		return larkim.MsgTypeAudio
-	case larkim.FileTypeMp4:
+	case larkim.CreateFileFileTypeMp4:
 		return larkim.MsgTypeMedia
 	default:
 		return larkim.MsgTypeFile
@@ -2895,6 +3140,42 @@ func buildReplyContent(content string) (msgType string, body string) {
 		return larkim.MsgTypePost, buildPostMdJSON(content)
 	}
 	return larkim.MsgTypeInteractive, buildCardJSON(sanitizeMarkdownURLs(preprocessFeishuMarkdown(content)))
+}
+
+func buildDocCommentPrompt(fileType, fileToken, commentID, replyID, noticeType string) string {
+	var b strings.Builder
+	b.WriteString("A Feishu/Lark document comment mentioned this bot.\n\n")
+	b.WriteString("Comment event metadata:\n")
+	b.WriteString("- file_type: " + fileType + "\n")
+	b.WriteString("- file_token: " + fileToken + "\n")
+	b.WriteString("- comment_id: " + commentID + "\n")
+	if replyID != "" {
+		b.WriteString("- reply_id: " + replyID + "\n")
+	}
+	if noticeType != "" {
+		b.WriteString("- notice_type: " + noticeType + "\n")
+	}
+	b.WriteString("\nUse `lark-cli ... --as user` to inspect the comment, read the document, or create/edit Drive/Docx resources. Do not use `--as bot` for document, Drive, Docx, Wiki, Sheets, Slides, Base, or Whiteboard read/write operations.\n")
+	b.WriteString("Useful starting point:\n")
+	b.WriteString("`lark-cli drive file.comments list --params '{\"file_token\":\"" + fileToken + "\",\"file_type\":\"" + fileType + "\",\"is_solved\":false}' --as user`\n\n")
+	b.WriteString("Reply normally with the answer. cc-connect will post your response back to this document comment thread.")
+	return b.String()
+}
+
+func buildDocCommentTextElements(content string) []*larkdrive.ReplyElement {
+	const maxRunesPerElement = 1000
+	runes := []rune(content)
+	elements := make([]*larkdrive.ReplyElement, 0, (len(runes)/maxRunesPerElement)+1)
+	for len(runes) > 0 {
+		n := min(len(runes), maxRunesPerElement)
+		text := html.EscapeString(string(runes[:n]))
+		runes = runes[n:]
+		elements = append(elements, larkdrive.NewReplyElementBuilder().
+			Type("text_run").
+			TextRun(larkdrive.NewTextRunBuilder().Text(text).Build()).
+			Build())
+	}
+	return elements
 }
 
 // hasComplexMarkdown detects code blocks or tables that require card rendering.
@@ -3390,7 +3671,7 @@ func (p *Platform) replyMessage(ctx context.Context, rc replyContext, msgType, c
 
 func (p *Platform) createMessage(ctx context.Context, chatID, msgType, content, op string) error {
 	req := larkim.NewCreateMessageReqBuilder().
-		ReceiveIdType(larkim.ReceiveIdTypeChatId).
+		ReceiveIdType(larkim.CreateMessageV1ReceiveIDTypeChatId).
 		Body(larkim.NewCreateMessageReqBodyBuilder().
 			ReceiveId(chatID).
 			MsgType(msgType).
@@ -4226,7 +4507,7 @@ func (p *Platform) SendPreviewStart(ctx context.Context, rctx any, content strin
 		}
 	} else {
 		req := larkim.NewCreateMessageReqBuilder().
-			ReceiveIdType(larkim.ReceiveIdTypeChatId).
+			ReceiveIdType(larkim.CreateMessageV1ReceiveIDTypeChatId).
 			Body(larkim.NewCreateMessageReqBodyBuilder().
 				ReceiveId(chatID).
 				MsgType(larkim.MsgTypeInteractive).
@@ -4585,7 +4866,7 @@ func (p *Platform) SendAudio(ctx context.Context, rctx any, audio []byte, format
 		return p.withFreshTenantAccessTokenRetry(ctx, "upload audio", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			req := larkim.NewCreateFileReqBuilder().
 				Body(larkim.NewCreateFileReqBodyBuilder().
-					FileType(larkim.FileTypeOpus).
+					FileType(larkim.CreateFileFileTypeOpus).
 					FileName("tts_audio.opus").
 					File(bytes.NewReader(audio)).
 					Build()).
@@ -4660,7 +4941,7 @@ func (p *Platform) SendVideo(ctx context.Context, rctx any, video []byte, format
 		return p.withFreshTenantAccessTokenRetry(ctx, "upload video", func(client *lark.Client, options ...larkcore.RequestOptionFunc) error {
 			req := larkim.NewCreateFileReqBuilder().
 				Body(larkim.NewCreateFileReqBodyBuilder().
-					FileType(larkim.FileTypeMp4).
+					FileType(larkim.CreateFileFileTypeMp4).
 					FileName(fileName).
 					File(bytes.NewReader(video)).
 					Build()).
@@ -6251,10 +6532,9 @@ func buildRichCardJSONBytes(status core.CardStatus, steps []core.ToolStep, markd
 				continue
 			}
 			footerElements = append(footerElements, map[string]any{
-				"tag":        "markdown",
-				"content":    sanitizeCardMarkdownForCard(line),
-				"text_size":  "notation",
-
+				"tag":       "markdown",
+				"content":   sanitizeCardMarkdownForCard(line),
+				"text_size": "notation",
 			})
 		}
 	}
